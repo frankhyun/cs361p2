@@ -1,0 +1,23 @@
+1 Do you like this quiz?
+A Yes
+B No
+
+A
+
+2 Which animal is best?
+A Cat
+B Dog
+C Turtle
+D Cow
+E Pigeon
+
+C
+
+3 What is the best car in the world?
+A Lamborghini Murcielago
+B Ferrari SF90
+C Aston Martin DB12 Volante
+D Bugatti Tourbillon
+E Honda Civic
+
+E
