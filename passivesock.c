@@ -1,7 +1,35 @@
 /* passivesock.c - passivesock */
 /*
- * This code was adapted from the Stevens and 
+ * This code was adapted from the Stevens and
  * the Comer books on Network Programming
+ */
+
+/*
+ * ROLE IN THE SYSTEM
+ * ------------------
+ * passivesock is the SERVER-SIDE bootstrap helper, the mirror of
+ * connectsock.c. A "passive" socket is one that listens for incoming
+ * connections rather than initiating one.
+ *
+ *   server.c --[calls]--> passivesock()  --[returns listening fd]--> server.c
+ *                                                                    accept()
+ *                                                                    loop
+ *
+ * Relationship to the other three files:
+ *
+ *   client.c  ---connectsock()---> TCP ---passivesock() fd--->  server.c
+ *                                                                  |
+ *                                                              accept()
+ *                                                                  |
+ *                                                              new fd per
+ *                                                              connection
+ *                                                              -> thread
+ *
+ * server.c calls passivesock() exactly once at startup to get the
+ * "master socket" msock. It then loops on accept(msock, ...) which
+ * returns a fresh per-client socket for each inbound connection,
+ * one of which was just opened by a call to connectsock() inside
+ * some client.c process.
  */
 
 #include <sys/types.h>
@@ -20,6 +48,18 @@ static u_short	portbase = 37000;    /* port base, for non-root servers	*/
 
 /*------------------------------------------------------------------------
  * passivesock - allocate & bind a server socket using TCP or UDP
+ *
+ * Steps (mirror of connectsock, but ending in bind+listen, not connect):
+ *   1. Resolve service name -> port number (or use *rport=1 to let
+ *      the kernel pick a free port, which is then written back via
+ *      *rport so the caller can print it for the user).
+ *   2. Resolve protocol name -> kernel protocol number.
+ *   3. socket(2) to allocate the fd.
+ *   4. bind(2) to the chosen port on INADDR_ANY (all interfaces).
+ *   5. listen(2) with backlog qlen, if TCP.
+ *
+ * Returns: a listening fd on success (server.c will accept() on it),
+ *          exit()s on failure.
  *------------------------------------------------------------------------
  */
 
