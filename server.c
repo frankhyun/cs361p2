@@ -224,7 +224,7 @@ typedef struct
     pthread_cond_t ans_cv;
     int ans_ready;          /* 0 = pending, 1 = answer stored               */
     char ans_buf[64];       /* the answer string (default "NOANS")          */
-    struct timeval ans_time; /* wall time when answer arrived, for tie-break*/
+    struct timeval ans_time; /* time stamp for tie-break*/
 
     int aborted;            /* 1 = socket gone, skip further I/O on this cl */
 } Client;
@@ -309,10 +309,13 @@ static void *reader_thread(void *arg)
          * client's own deadline so we don't declare NOANS before the
          * client has had a chance to send its answer over the wire.
          */
+        // Reader Timeout
+        // Returns -2 if the reader times out, answer should stay "NOANS".
         int r = read_crlf_line(cl->sock, buf, sizeof(buf), TIMEOUT_SECS + 3);
 
         char ans[64];
         strcpy(ans, "NOANS"); /* default if anything goes wrong       */
+        // Nothing went wrong.
         if (r > 0 && strncmp(buf, "ANS|", 4) == 0)
         {
             /* Strip "ANS|" prefix, trim trailing whitespace          */
@@ -322,6 +325,7 @@ static void *reader_thread(void *arg)
             while (al > 0 && (ans[al - 1] == ' ' || ans[al - 1] == '\t'))
                 ans[--al] = '\0';
         }
+        // Error
         else if (r == -1)
         {
             /* Socket closed or errored, mark client dead so the quiz*/
@@ -331,6 +335,9 @@ static void *reader_thread(void *arg)
         /* r == -2 -> read timed out, ans stays "NOANS"              */
 
         /* Publish the answer to the quiz driver and wake it         */
+
+        // RACE CONDITION 3: Reader thread.
+        // Writes "CORRECT\0"
         pthread_mutex_lock(&cl->ans_mu);
         strncpy(cl->ans_buf, ans, sizeof(cl->ans_buf) - 1);
         cl->ans_buf[sizeof(cl->ans_buf) - 1] = '\0';
@@ -364,19 +371,21 @@ static void run_quiz(void)
         /* Arm every answer slot so the reader threads know a new    */
         /* question is coming. They each wake up, block on read()    */
         /* of their socket, and will post an ANS back into the slot. */
+        // Phase 1: Server Waits for all answers before next question
         for (int c = 0; c < n; c++)
         {
             Client *cl = g_clients[c];
             pthread_mutex_lock(&cl->ans_mu);
-            cl->ans_ready = 0;
+            cl->ans_ready = 0; // slot empty waiting for answer
             strcpy(cl->ans_buf, "NOANS");
-            pthread_cond_signal(&cl->ans_cv);
+            pthread_cond_signal(&cl->ans_cv); // wait reader, new question ready
             pthread_mutex_unlock(&cl->ans_mu);
         }
 
         /* Broadcast QUES|size|text to every live client. Size is    */
         /* sent explicitly so the client can read the exact payload  */
         /* even if the question text itself contains newlines.       */
+        // Broadcast question
         int textlen = (int)strlen(questions[qi].text);
         int hlen = snprintf(buf, sizeof(buf), "QUES|%d|", textlen);
         for (int c = 0; c < n; c++)
@@ -403,6 +412,7 @@ static void run_quiz(void)
         /* Wait for each client to post, or for the shared deadline  */
         /* to fire. Because the deadline is absolute, clients we     */
         /* wait on later don't get extra time.                       */
+        // Collect answers from broadcast
         for (int c = 0; c < n; c++)
         {
             Client *cl = g_clients[c];
@@ -430,6 +440,9 @@ static void run_quiz(void)
             Client *cl = g_clients[c];
             char answer[64];
             /* Copy out under lock to avoid racing with reader_thread*/
+
+            // RACE CONDITION 3: Torn Read/ Write on Answer Buffer
+            // Reads answer
             pthread_mutex_lock(&cl->ans_mu);
             strncpy(answer, cl->ans_buf, sizeof(answer) - 1);
             answer[sizeof(answer) - 1] = '\0';
@@ -580,6 +593,9 @@ static void *client_handler(void *arg)
 
     /* Role decision under lock: whoever finds SRV_IDLE becomes the  */
     /* leader and transitions the server into SRV_ASSEMBLING.        */
+
+    // RACE CONDITION 1: Two Leaders
+    // Without lock both threads think they're leaders.
     pthread_mutex_lock(&g_mu);
     int is_leader = (g_state == SRV_IDLE); // First connection is leader.
 
@@ -695,6 +711,8 @@ static void *client_handler(void *arg)
         send_all(sock, "WAIT\r\n", 6);
 
         /* Block until every member's handler has joined and signalled*/
+        // Quiz starts only when the group is full.
+        // Unlock g_mu, put thread to sleep, re-lock g_mu
         pthread_mutex_lock(&g_mu);
         while (g_joined < g_group_size)
             pthread_cond_wait(&g_cv, &g_mu);
@@ -752,12 +770,15 @@ static void *client_handler(void *arg)
 
     /* ----------------------------------------------------------------
      * MEMBER PATH
-     * Much simpler, register ourselves in g_clients[], answer
+     * Register ourselves in g_clients[], answer
      * questions via our reader_thread, then wait for the leader's
      * handler to tear everything down.
      * ---------------------------------------------------------------- */
 
     /* Final space check under lock, then claim our slot             */
+
+    // RACE CONDITION 2: Array Slot Collision.
+    // Two members join at the same time, both think they're at index 1.
     pthread_mutex_lock(&g_mu);
     if (g_state != SRV_ASSEMBLING || g_group_size == 0 ||
         g_joined >= g_group_size)
