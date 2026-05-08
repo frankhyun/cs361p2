@@ -245,8 +245,10 @@ typedef enum
     SRV_QUIZZING            /* quiz in progress, reject new connections     */
 } SrvState;
 
-/* g_mu protects every global below; g_cv wakes handlers on state changes  */
+/* global mutex, protects every global shared server state below*/
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+/* global condition variable, threads use to wait for and notify about changes 
+in server state.*/
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 
 static SrvState g_state = SRV_IDLE;
@@ -261,6 +263,7 @@ static int g_quiz_over = 0; /* set by run_quiz() when done, wakes members  */
 
 static void *reader_thread(void *arg)
 {
+    // Client.
     Client *cl = (Client *)arg;
     char buf[BUFSIZE];
 
@@ -278,6 +281,9 @@ static void *reader_thread(void *arg)
          * blocks here until the first QUES has been broadcast.
          */
         pthread_mutex_lock(&cl->ans_mu);
+        // Wait until the previous answer has been consumed
+        // and the slot is reset (ans_ready == 0) before reading a new ANS
+        // see run_quiz for where it's reset
         while (cl->ans_ready)
         {
             /* Check shutdown flag before sleeping so we don't miss it*/
@@ -341,7 +347,8 @@ static void *reader_thread(void *arg)
         pthread_mutex_lock(&cl->ans_mu);
         strncpy(cl->ans_buf, ans, sizeof(cl->ans_buf) - 1);
         cl->ans_buf[sizeof(cl->ans_buf) - 1] = '\0';
-        gettimeofday(&cl->ans_time, NULL); /* for first-correct tiebreak*/
+        // Each client gets correctness from is_correct and a timestamp with ans_time
+        gettimeofday(&cl->ans_time, NULL); // for first-correct tiebreak
         cl->ans_ready = 1;
         pthread_cond_signal(&cl->ans_cv);
         pthread_mutex_unlock(&cl->ans_mu);
@@ -371,7 +378,7 @@ static void run_quiz(void)
         /* Arm every answer slot so the reader threads know a new    */
         /* question is coming. They each wake up, block on read()    */
         /* of their socket, and will post an ANS back into the slot. */
-        // Phase 1: Server Waits for all answers before next question
+        // Synchronization Pattern 2: Server Waits for all answers before next question
         for (int c = 0; c < n; c++)
         {
             Client *cl = g_clients[c];
@@ -398,7 +405,6 @@ static void run_quiz(void)
             }
         }
 
-        /* Collect answers within a single wall-clock deadline.      */
         /* Each client has its own reader_thread doing the actual    */
         /* read, so all sockets are drained in parallel. We then     */
         /* score by ans_time timestamps, so the first correct answer */
@@ -459,9 +465,10 @@ static void run_quiz(void)
                     qi + 1, cl->name, answer, questions[qi].correct,
                     is_correct ? "CORRECT" : (is_noans ? "NOANS" : "WRONG"));
 
+            // Winner got the right answer.
             if (is_correct)
             {
-                /* Is this the earliest correct answer so far?       */
+                // Check if earliest correct answer so far.
                 if (first_correct < 0 ||
                     at.tv_sec < best_time.tv_sec ||
                     (at.tv_sec == best_time.tv_sec &&
@@ -594,8 +601,7 @@ static void *client_handler(void *arg)
     /* Role decision under lock: whoever finds SRV_IDLE becomes the  */
     /* leader and transitions the server into SRV_ASSEMBLING.        */
 
-    // RACE CONDITION 1: Two Leaders
-    // Without lock both threads think they're leaders.
+    // RACE CONDITION 1: Two Leaders, determine role
     pthread_mutex_lock(&g_mu);
     int is_leader = (g_state == SRV_IDLE); // First connection is leader.
 
@@ -612,6 +618,7 @@ static void *client_handler(void *arg)
         /* Recheck space, between the fast reject and now a race     */
         /* could have filled the group.                              */
         if (g_group_size == 0 ||
+            // full group
             g_joined >= g_group_size)
         {
             pthread_mutex_unlock(&g_mu);
@@ -710,8 +717,8 @@ static void *client_handler(void *arg)
         /* Tell client to sit tight while we gather members          */
         send_all(sock, "WAIT\r\n", 6);
 
-        /* Block until every member's handler has joined and signalled*/
-        // Quiz starts only when the group is full.
+        // Synchronization Pattern 1: Quiz starts only when the group is full.
+        // Block until every member's handler has joined and signalled
         // Unlock g_mu, put thread to sleep, re-lock g_mu
         pthread_mutex_lock(&g_mu);
         while (g_joined < g_group_size)
@@ -779,7 +786,12 @@ static void *client_handler(void *arg)
 
     // RACE CONDITION 2: Array Slot Collision.
     // Two members join at the same time, both think they're at index 1.
+    // g_clients[] is an array of connected clients in the group
+    // basically we need to lock, make sure there's room, then store the client in the array
+    // race condition occurs when two clients think they're at the same idx and overwrite one another
     pthread_mutex_lock(&g_mu);
+    
+    // Safety check: make sure there's still room
     if (g_state != SRV_ASSEMBLING || g_group_size == 0 ||
         g_joined >= g_group_size)
     {
@@ -791,11 +803,13 @@ static void *client_handler(void *arg)
         close(sock);
         return NULL;
     }
-    int idx = g_joined;
-    g_clients[idx] = cl;
-    g_joined++;
-    int group_full = (g_joined >= g_group_size); /* did we complete it?*/
-    pthread_mutex_unlock(&g_mu);
+
+    // Critical Three Operations:
+    int idx = g_joined; // read current count
+    g_clients[idx] = cl; // use it as an index
+    g_joined++; // increment for next member
+    int group_full = (g_joined >= g_group_size); // did we complete it? 
+    pthread_mutex_unlock(&g_mu); // unlock: other threads can now execute
 
     /* Greet: "you are a member, send me a JOIN message"             */
     send_all(sock, "QS|JOIN\r\n", 9);
@@ -825,10 +839,11 @@ static void *client_handler(void *arg)
 
     /* If our join completed the group, wake the leader who is       */
     /* parked on g_cv waiting for g_joined >= g_group_size.          */
+    // last to join broadcasts
     if (group_full)
     {
         pthread_mutex_lock(&g_mu);
-        pthread_cond_broadcast(&g_cv);
+        pthread_cond_broadcast(&g_cv); // wake all waiters
         pthread_mutex_unlock(&g_mu);
     }
 
@@ -838,8 +853,9 @@ static void *client_handler(void *arg)
     pthread_create(&rtid, NULL, reader_thread, cl);
     pthread_detach(rtid);
 
-    /* Park until run_quiz() flips g_quiz_over. Leader's handler     */
+    /* Park (wait) until run_quiz() flips g_quiz_over. Leader's handler     */
     /* does all cleanup (free, close, state reset) for everyone.     */
+    // see line 556.
     pthread_mutex_lock(&g_mu);
     while (!g_quiz_over)
         pthread_cond_wait(&g_cv, &g_mu);
@@ -908,6 +924,8 @@ int main(int argc, char *argv[])
      */
     for (;;)
     {
+        // accepting loop
+        // listens for master socket, creates a client's server socket
         struct sockaddr_in fsin;
         socklen_t alen = sizeof(fsin);
         int ssock = accept(msock, (struct sockaddr *)&fsin, &alen);
@@ -927,6 +945,7 @@ int main(int argc, char *argv[])
         aa->sock = ssock;
 
         pthread_t tid;
+        // client handler per connection.
         pthread_create(&tid, NULL, client_handler, aa);
         pthread_detach(tid);
     }
